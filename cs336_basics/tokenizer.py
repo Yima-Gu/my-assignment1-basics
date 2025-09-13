@@ -1,5 +1,7 @@
 # In cs336_basics/tokenizer.py
 
+import multiprocessing
+from collections import Counter
 import regex as re
 
 def train_bpe(input_path: str, vocab_size: int, special_tokens: list [str]):
@@ -43,22 +45,18 @@ def train_bpe(input_path: str, vocab_size: int, special_tokens: list [str]):
     # divide the `text` string into a list of substrings
     text_chunks = re.split(f"({special_pattern})",text)
 
-    # The main pre-tokenization regex pattern from GPT-2
-    PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+    text_only_chunks = [chunk for chunk in text_chunks if chunk and chunk not in special_tokens]
 
-    word_freqs = {}
+    # Create a pool of processes and map the worker function to the chunks
+    with multiprocessing.Pool() as pool:
+        list_of_freq_dicts = pool.map(process_text_chunk, text_only_chunks)
 
-    for chunk in text_chunks:
-        if chunk in special_tokens:
-            # we don't process special tokens with regex
-            continue
+    word_freqs = Counter()
+    for freq_dict in list_of_freq_dicts:
+        word_freqs.update(freq_dict)
 
-        # use re.findall to get all the matching "words" from the chunk
-        words = re.findall(PAT,chunk)
+    word_freqs = dict(word_freqs)
 
-        # count the word frequency
-        for word in words:
-            word_freqs[word] = word_freqs.get(word , 0) + 1
 
     # Represent words as tuples of their bytes for easier processing
     # e.g., "hello" -> (b'h', b'e', b'l', b'l', b'o')
@@ -92,6 +90,9 @@ def train_bpe(input_path: str, vocab_size: int, special_tokens: list [str]):
     
     # --- Step 4: The Main Merge Loop ---
     for i in range(num_merges):
+        if not pair_counts:
+            break
+
         # Find the highest freqency values 
         max_freq = max(pair_counts.values())
         # Get all pairs that are tied for this frequency
@@ -160,6 +161,8 @@ def update_pair_counts(pair_counts, old_word, new_word, freq):
         pair = (old_word[i], old_word[i+1])
         if pair in pair_counts:
             pair_counts[pair] -= freq
+            if pair_counts[pair] <= 0:
+                del pair_counts[pair]
     
     # Step 2: Increment/add the counts for all pairs from the NEW word.
     for i in range(len(new_word)-1):
@@ -185,3 +188,23 @@ def update_stats(stats, old_word_tuple, new_word_tuple):
         if token not in stats:
             stats[token] = set()
         stats[token].add(new_word_tuple)
+
+# This is the "worker" function that will run in parallel
+def process_text_chunk(text_chunk):
+    """Take a chunk of text and returns a dictionary of word frequencies"""
+    PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+    word_freqs = Counter()
+
+    words = re.findall(PAT, text_chunk)
+    for word in words:
+        word_freqs[word]+=1
+
+    return word_freqs
+
+
+class Tokenizer:
+    def __init__(self, vocab: dict[int, bytes], merges: list[tuple[bytes, bytes]], special_tokens: list[str] = None):
+        # We'll build the setup logic here.
+        pass
+
+    # We will add other methods like encode() and decode() later.
