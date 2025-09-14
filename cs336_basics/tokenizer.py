@@ -3,6 +3,11 @@
 import multiprocessing
 from collections import Counter
 import regex as re
+import pickle
+import json
+from typing import Iterable, Iterator
+
+# --- MAIN TRAINING FUNCTION ---
 
 def train_bpe(input_path: str, vocab_size: int, special_tokens: list [str]):
     """
@@ -128,6 +133,8 @@ def train_bpe(input_path: str, vocab_size: int, special_tokens: list [str]):
                     
     return vocab, merges
 
+# --- HELPER FUNCTIONS FOR TRAINING ---
+
 def merge_pair_in_word(word_tuple, pair_to_merge, new_token):
 
     new_word_parts = []
@@ -201,10 +208,141 @@ def process_text_chunk(text_chunk):
 
     return word_freqs
 
+# Find the best pair with the least merge rank 
+def find_best_pair(tokens, mergeranks):
+    least_pair_rank = float('inf')
+    best_pair = None
+    
+    for i in range(len(tokens)-1):
+        current_pair = (tokens[i], tokens[i+1])
+        if (current_pair in mergeranks) and (mergeranks[current_pair] < least_pair_rank):
+            least_pair_rank = mergeranks[current_pair]
+            best_pair = current_pair
+            
+    return best_pair
+    
+# Merge the best pair into a new list of tokens
+def merge_the_pair(tokens, best_pair):
+    new_token_list = []
+    new_token = best_pair[0] + best_pair[1]
+    i = 0
+    while i < len(tokens):
+        # Check if the current and next tokens is the best_pair
+        if (i < len(tokens) -1 ) and ((tokens[i], tokens[i+1]) ==best_pair):
+            new_token_list.append(new_token)
+            i+=2
+        else:
+            new_token_list.append(tokens[i])
+            i+=1
+        
+    return new_token_list
+            
+
+# --- THE TOKENIZER CLASS ---
 
 class Tokenizer:
     def __init__(self, vocab: dict[int, bytes], merges: list[tuple[bytes, bytes]], special_tokens: list[str] = None):
-        # We'll build the setup logic here.
-        pass
+        
+        # 1. Store the vocabulary for DECODING (ID -> bytes)
+        self.vocab = vocab
+        # Store PAT
+        self.pat = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 
-    # We will add other methods like encode() and decode() later.
+        # 2. Create and store the inverted vocabulary for ENCODING (bytes -> ID)
+        self.encoder = {token_bytes: token_id for token_id, token_bytes in vocab.items()}
+
+        # 3. Create and store a dictionary for fast merge lookups (pair -> rank)
+        # The rank is just the position in the ordered merge list 
+        self.merge_ranks = {pair: i for i, pair in enumerate(merges)}
+
+        # 4. Handle special tokens
+        self.special_tokens = {} # str -> bytes
+        if special_tokens:
+            # sort the tokens from longest to shortest
+            special_tokens.sort(key=len, reverse=True)
+            
+            for token_str in special_tokens:
+                self.special_tokens[token_str] = token_str.encode('utf-8')
+
+        # 5. Create a pre-compiled  regex to find special tokens during encoding
+        # This is much faster than searching for them manually
+        if self.special_tokens:
+            special_pattern = f"({'|'.join(re.escape(s) for s in self.special_tokens)})"
+            self.special_tokens_pattern = re.compile(special_pattern)
+        else:
+            self.special_tokens_pattern = None
+    
+    def encode(self, text: str)-> list[int]:
+        final_token_ids = []
+
+        if self.special_tokens_pattern is None:
+            chunks = [text]
+        else:
+            chunks = self.special_tokens_pattern.split(text)
+        
+        for chunk in chunks:
+            if chunk in self.special_tokens:
+                final_token_ids.append(self.encoder[self.special_tokens[chunk]])
+            else:
+                # 1. Pre-tokenize the chunk into smaller words
+                words = re.findall(self.pat, chunk)
+
+                for word in words:
+                    tokens = [bytes([b]) for b in word.encode('utf-8')]
+
+                    # Loop until no more merges can be applied
+                    while len(tokens) >1:
+                        # find the best pair to merge in the current `tokens` list
+                        best_pair = find_best_pair(tokens, self.merge_ranks)
+
+                        if best_pair is None:
+                            break # No more merges are possible in the word
+
+                        tokens = merge_the_pair(tokens, best_pair)
+
+                    for token in tokens: 
+                        final_token_ids.append(self.encoder[token])
+
+
+        return final_token_ids
+
+    def decode(self, ids: list[int]) -> str:
+        
+        # Get all the bytes pieces from the vocabulary
+        byte_pieces = [self.vocab[token_id] for token_id in ids]
+        
+        full_byte_sequence = b"".join(byte_pieces)
+        
+        return full_byte_sequence.decode('utf-8', errors='replace')
+    
+    def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]:
+        """
+        Encodes an iterable of strings, yielding token IDs one by one.
+        """
+        # Loop through each piece of text from the iterable (e.g., each line from a file)
+        for text_chunk in iterable:
+            # Use your existing encode method on the chunk and yield each ID from the result
+            yield from self.encode(text_chunk)
+    
+    @classmethod
+    def from_files(cls, vocab_filepath, merges_filepath, special_tokens=None):
+        """
+        Constructs a Tokenizer from saved vocab and merges files.
+        """
+        # 1. Load the vocabulary from the JSON files. 
+        print(f"Loading vocabulary from {vocab_filepath} ...")
+        with open(vocab_filepath, 'r') as f:
+            serializable_vocab = json.load(f)
+            # Convert the saved lists of integers back into bytes objects
+            vocab = {int(k): bytes(v) for k, v in serializable_vocab.items()}
+            
+        # 2. Load the merges from the pickle file
+        print(f"Loading merges from {merges_filepath}")
+        with open (merges_filepath, 'rb') as f:
+            merges = pickle.load(f)
+        
+        # 3. Call the class's own __init__ method to create a new instance
+        return cls(vocab= vocab, merges = merges, special_tokens = special_tokens)
+    
+
+    

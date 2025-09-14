@@ -1,6 +1,6 @@
 import json
 
-VOCAB_FILE = "tinystories_vocab.josn"
+VOCAB_FILE = "/data/yima/playground/assignment1-basics/results/OpenWebText_vocab.json"
 
 # Load the saved vocabulary
 with open(VOCAB_FILE, 'r') as f:
