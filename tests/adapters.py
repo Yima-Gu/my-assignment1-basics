@@ -1,6 +1,8 @@
 from __future__ import annotations
 from cs336_basics.tokenizer import train_bpe
 from cs336_basics.tokenizer import train_bpe, Tokenizer
+from cs336_basics.model import Linear
+from cs336_basics.model import Embedding
 
 import os
 from collections.abc import Iterable
@@ -30,9 +32,22 @@ def run_linear(
     Returns:
         Float[Tensor, "... d_out"]: The transformed output of your linear module.
     """
-
-    raise NotImplementedError
-
+    
+    # 1. Get the device and the data type from the input tensor for consistency
+    device = in_features.device
+    dtype = in_features.dtype
+    
+    # 2. Create an instance of your Linear module
+    linear_layer = Linear(d_in, d_out, device= device, dtype = dtype)
+    
+    # 3. Load the provided weights.
+    # We usetranpose method to match the (d_in, d_out) shape 
+    state_dict = {'W': weights.T}
+    linear_layer.load_state_dict(state_dict)
+    
+    # 4. Run the forward pass by calling a layer on the input features.
+    return linear_layer(in_features)
+    
 
 def run_embedding(
     vocab_size: int,
@@ -52,8 +67,17 @@ def run_embedding(
     Returns:
         Float[Tensor, "... d_model"]: Batch of embeddings returned by your Embedding layer.
     """
-
-    raise NotImplementedError
+    
+    dtype = weights.dtype
+    device = weights.device
+    
+    # Create the instance of the Embedding_layer
+    embedding_layer = Embedding(vocab_size, d_model, device=device, dtype= dtype)
+    
+    state_dict  = {'embedding_matrix': weights}
+    embedding_layer.load_state_dict(state_dict )
+    
+    return embedding_layer(token_ids)
 
 
 def run_swiglu(

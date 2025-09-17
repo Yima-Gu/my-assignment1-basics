@@ -344,5 +344,3 @@ class Tokenizer:
         # 3. Call the class's own __init__ method to create a new instance
         return cls(vocab= vocab, merges = merges, special_tokens = special_tokens)
     
-
-    
