@@ -1,5 +1,6 @@
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 class Linear(nn.Module):
     def __init__(self, in_features: int, out_features: int, device =None, dtype = None):
@@ -39,3 +40,120 @@ class Embedding(nn.Module):
         # Pytorch automatically looks up the vector for each ID
         # and return a new tensor with the results.
         return self.embedding_matrix[token_ids]
+    
+    
+class RMSNorm(nn.Module):
+    def __init__(self, d_model: int, eps: float = 1e-5, device=None, dtype = None):
+        super().__init__()
+        
+        self.eps = eps
+        
+        # Create a tensor of ones with the shape (d_model,) which can be broadcast
+        gain_tensor = torch.ones(d_model, device=device, dtype = dtype)
+        
+        # Register it as a learnable parameter
+        self.g = nn.Parameter(gain_tensor)
+        
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Remember the original data type
+        in_dtype = x.dtype
+        
+        # Upcast to float32 for numerical stability
+        x = x.to(torch.float32)
+        
+        normalized_x = x/ torch.sqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        
+        # Apply the learnable gain
+        output = normalized_x * self.g
+        
+        # Downcast back to the original data type
+        return output.to(in_dtype)
+    
+# Position-Wise FFN, used to add computational depth to the model
+class PositionWiseFeedForward(nn.Module):
+    def __init__(self, d_model: int, d_ff: int, device= None, dtype = None):
+        super().__init__()
+
+        # Transform from d_model -> d_ff
+        self.W_1 = Linear(d_model, d_ff, device = device, dtype = dtype)
+        self.W_3 = Linear(d_model, d_ff, device = device, dtype = dtype)
+
+        # Transform from d_ff -> d_model
+        self.W_2 = Linear(d_ff, d_model, device = device, dtype = dtype)
+
+
+    def forward(self, x:torch.Tensor) -> torch.Tensor:
+        # Pass the input through the first and third linear layers
+        x1 = self.W_1(x)
+        x3 = self.W_3(x)
+
+        # Apply the SiLU activation function to the output of W1
+        activated_x1 = x1 * F.sigmoid(x1)
+
+        # Element-wise multiply the activated gate with the output of W_3
+        gated_output = activated_x1 * x3
+
+        # Pass the result through the final linear layer
+        output = self.W_2(gated_output)
+
+        return output
+
+# Relative Positional Embeddings: used to "help" model understand the relative positions of tokens
+class RoPE(nn.Module):
+    def __init__(self, theta: float, d_k: int, max_seq_len: int, device=None, dtype =None):
+        super().__init__()
+        
+        # Create a tensor for the position 'i' from 0 to max_seq_len -1
+        # represent the diffreent position of the token
+        positions = torch.arange(max_seq_len, device = device)
+        
+        # Create a tensor for the even dimension indices (0,2,4,...)
+        # represent the different hidden_dim of the token
+        dim_indices = torch.arange(0, d_k, 2, device = device)
+        
+        # Calculate the dimension term from the formula
+        inv_freq = 1.0 /(theta**(dim_indices.float() / d_k))
+        
+        # This efficiently combines the position and dimension terns to
+        # full grid of theta angles with shape (max_seq_len, d_k /2)
+        # torch.outer is used to calculate the outer product of two vectors
+        thetas = torch.outer(positions, inv_freq)
+        
+        # Calculate the sine and cosine values
+        sin_cache = torch.sin(thetas)
+        cos_cache = torch.cos(thetas)
+        
+        # This stores a tensor as part of the module's state, but not as a
+        # learnable parameter. This is perfect for pre-computed values.
+        self.register_buffer('sin_cache', sin_cache.to(dtype))
+        self.register_buffer('cos_cache', cos_cache.to(dtype))
+        
+        
+    
+    def forward(self, x: torch.Tensor, token_positions: torch.Tensor) -> torch.Tensor:
+        
+        # x has the shape of (..., seq_len, d_k)
+        # token_position has shape (..., seq_len)
+        
+        # 1. Get the correct sin/cos values from your cache for the given positions 
+        # Use the lookup tables to find the sin and cos of the corresponding position
+        # These will have shape (..., seq_len, d_k/2)
+        cos = self.cos_cache[token_positions]
+        sin = self.sin_cache[token_positions]
+        
+        # 2. Split the correct sin/cos values from your cache for the givem positions 
+        x_even = x[..., ::2] # Takes all even indices (0,2,4,...)
+        x_odd = x[..., 1::2] # Takes all odd indices (1,3,5,...)
+        
+        # This is equivalent to the matrix multiplication but much faster
+        x_rotated_even = x_even * cos - x_odd * sin
+        x_rotated_odd = x_even * sin + x_odd * cos
+        
+        # 4. Combine the rotated halves back into a single tensor
+        x_rotated = torch.empty_like(x)
+        x_rotated[..., ::2] = x_rotated_even
+        x_rotated[..., 1::2] = x_rotated_odd
+        
+        return x_rotated
+        
