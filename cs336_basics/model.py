@@ -1,6 +1,8 @@
 import torch
+import math
 from torch import nn
 import torch.nn.functional as F
+from einops import einsum
 
 class Linear(nn.Module):
     def __init__(self, in_features: int, out_features: int, device =None, dtype = None):
@@ -156,4 +158,55 @@ class RoPE(nn.Module):
         x_rotated[..., 1::2] = x_rotated_odd
         
         return x_rotated
+
+# softmax
+def softmax(x: torch.Tensor, dim: int) -> torch.Tensor:
+    # Subtract the maximum value from all the elements in the tensor to maintains tability
+    #   `keepdim = True` is crucial for broadcasting to work correctly later.
+    #   `torch.max` returns (values, indices), so we take the .values.
+    max_val = torch.max(x, dim=dim, keepdim = True).values
+    
+    # Subtract the max value. Broadcasting handles the shape automatically.
+    x_subtracted = x - max_val
+    
+    # Exponentiate.
+    x_exp = torch.exp(x_subtracted)
+    
+    # Sum along the specified dimension to get the denominator.
+    denominator = x_exp.sum(dim = dim, keepdim = True)
+    
+    # Normalize and return the result. 
+    return x_exp/ denominator
+    
+def scaled_dot_product_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    mask: torch.Tensor = None
+) -> torch.Tensor:
+    # In the code we use the Q@K^T as the torch uses the row-vector
+    # get d_k from the key tensor's shape
+    d_k = query.size(-1)
+    
+    # Calculate scores using sinsum for clarity
+    # This multiplies the query ('... q d') and the key ('... k d') along the 'd' dimension
+    scores = einsum(query, key, "... q d, ... k d -> ... q k")
+    
+    # Scale the scores
+    scaled_scores = scores / math.sqrt(d_k)
+    
+    # Step 3: Apply the mask (if exists)
+    if mask is not None:
+        # Where the mark is False, we replace the score with negative infinity
+        # This will make the softmax output for that position zero.
+        scaled_scores = scaled_scores.masked_fill(mask == False, -torch.inf)
         
+    # Apply the softmax to get probabilities
+    attention_probs = softmax(scaled_scores, dim = -1)
+    
+    # Apply probabilities to the value vectors using einsum
+    output = einsum(attention_probs, value, "... q k, ... k v -> ... q v")
+    
+    return output
+        
+    

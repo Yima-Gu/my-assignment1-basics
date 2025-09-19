@@ -6,6 +6,8 @@ from cs336_basics.model import Embedding
 from cs336_basics.model import RMSNorm
 from cs336_basics.model import PositionWiseFeedForward
 from cs336_basics.model import RoPE
+from cs336_basics.model import softmax
+from cs336_basics.model import scaled_dot_product_attention
 
 import os
 from collections.abc import Iterable
@@ -146,7 +148,7 @@ def run_scaled_dot_product_attention(
     Returns:
         Float[Tensor, " ... queries d_v"]: Output of SDPA
     """
-    raise NotImplementedError
+    return scaled_dot_product_attention(Q, K, V, mask=mask)
 
 
 def run_multihead_self_attention(
@@ -488,7 +490,7 @@ def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, "
         Float[Tensor, "..."]: Tensor of with the same shape as `in_features` with the output of
         softmax normalizing the specified `dim`.
     """
-    raise NotImplementedError
+    return softmax(in_features, dim=dim)
 
 
 def run_cross_entropy(
