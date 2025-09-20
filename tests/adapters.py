@@ -8,6 +8,9 @@ from cs336_basics.model import PositionWiseFeedForward
 from cs336_basics.model import RoPE
 from cs336_basics.model import softmax
 from cs336_basics.model import scaled_dot_product_attention
+from cs336_basics.model import MultiHeadSelfAttention
+from cs336_basics.model import TransformerBlock
+from cs336_basics.model import TransformerLM
 
 import os
 from collections.abc import Iterable
@@ -182,7 +185,17 @@ def run_multihead_self_attention(
         Float[Tensor, " ... sequence_length d_out"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+    device = in_features.device
+    dtype = in_features.dtype
+    multihead_attention_layer = MultiHeadSelfAttention(
+        d_model=d_model,num_heads=num_heads, device=device, dtype=dtype )
+    
+    state_dict = {'q_proj.W': q_proj_weight.T, 'k_proj.W': k_proj_weight.T,
+                  'v_proj.W': v_proj_weight.T, 'out_proj.W': o_proj_weight.T}
+    
+    multihead_attention_layer.load_state_dict(state_dict)
+    
+    return multihead_attention_layer(in_features)
 
 
 def run_multihead_self_attention_with_rope(
@@ -222,7 +235,27 @@ def run_multihead_self_attention_with_rope(
         Float[Tensor, " ... sequence_length d_out"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+    device = in_features.device
+    dtype = in_features.dtype 
+    
+    d_k = d_model // num_heads
+    
+    # Creat the rope module
+    rope = RoPE(theta=theta, d_k= d_k, 
+                max_seq_len= max_seq_len, device= device, dtype= dtype)
+    
+    # Create the multihead_attention_with_rope
+    mha_layer = MultiHeadSelfAttention(
+        d_model=d_model, num_heads= num_heads, rope= rope, device= device, dtype= dtype
+    )
+    
+    state_dict = {'q_proj.W': q_proj_weight.T, 'k_proj.W': k_proj_weight.T,
+                  'v_proj.W': v_proj_weight.T, 'out_proj.W': o_proj_weight.T}
+    
+    # ignore any keys in the dict that ao not have a corresponding key in the model
+    mha_layer.load_state_dict(state_dict, strict = False)
+    
+    return mha_layer(in_features,token_positions= token_positions)
 
 
 def run_rope(
@@ -323,7 +356,39 @@ def run_transformer_block(
         Float[Tensor, "batch sequence_length d_model"] Tensor with the output of
         running the Transformer block on the input features while using RoPE.
     """
-    raise NotImplementedError
+    device = in_features.device
+    dtype = in_features.dtype
+
+    _,sequence_length,_ = in_features.shape
+
+    # the splited d_model into small sequences
+    d_k = d_model // num_heads
+
+    # Create the token positions tensor: [[0,1,2,...]]
+    token_positions = torch.arange(sequence_length, device=device).unsqueeze(0)
+
+    rope = RoPE(theta=theta,d_k= d_k, max_seq_len= max_seq_len, device=device, dtype = dtype)
+    transformer_block = TransformerBlock(
+        d_model=d_model, num_heads= num_heads, d_ff= d_ff, rope= rope, device= device, dtype= dtype)
+    
+    state_dict = {
+        # Attention Layer Weights (MHA is a submodule of the block)
+        'mha_layer.q_proj.W': weights['attn.q_proj.weight'].T,
+        'mha_layer.k_proj.W': weights['attn.k_proj.weight'].T,
+        'mha_layer.v_proj.W': weights['attn.v_proj.weight'].T,
+        'mha_layer.out_proj.W': weights['attn.output_proj.weight'].T,
+        # Feed-Forward layer weights  
+        # We don't need the transpose here!
+        'rmsnorm_mha.g': weights['ln1.weight'],
+        'rmsnorm_ffn.g': weights['ln2.weight'],
+        # RMSNorm layer weights 
+        'ffn_layer.W_1.W': weights['ffn.w1.weight'].T,
+        'ffn_layer.W_2.W': weights['ffn.w2.weight'].T,
+        'ffn_layer.W_3.W': weights['ffn.w3.weight'].T}
+    
+    transformer_block.load_state_dict(state_dict=state_dict, strict= False)
+
+    return transformer_block(in_features, token_positions = token_positions)
 
 
 def run_transformer_lm(
@@ -405,7 +470,44 @@ def run_transformer_lm(
         Float[Tensor, "batch_size sequence_length vocab_size"]: Tensor with the predicted unnormalized
         next-word distribution for each token.
     """
-    raise NotImplementedError
+    
+    device = in_indices.device
+    dtype = weights['token_embeddings.weight'].dtype
+    transformerLM = TransformerLM(
+        vocab_size= vocab_size,
+        context_length= context_length,
+        d_model= d_model,
+        num_layer= num_layers,
+        num_heads= num_heads,
+        d_ff= d_ff,
+        theta= rope_theta,
+        device=device,
+        dtype= dtype)
+    
+    state_dict = {
+        'embedding.embedding_matrix': weights['token_embeddings.weight'],
+        'norm.g': weights['ln_final.weight'],
+        'linear.W': weights['lm_head.weight'].T    # Remember to transpose Linear weights
+    }
+
+    for i in range(num_layers):
+        # Attention block weights
+        state_dict[f'blocks.{i}.mha_layer.q_proj.W'] = weights[f'layers.{i}.attn.q_proj.weight'].T
+        state_dict[f'blocks.{i}.mha_layer.k_proj.W'] = weights[f'layers.{i}.attn.k_proj.weight'].T
+        state_dict[f'blocks.{i}.mha_layer.v_proj.W'] = weights[f'layers.{i}.attn.v_proj.weight'].T
+        state_dict[f'blocks.{i}.mha_layer.out_proj.W'] = weights[f'layers.{i}.attn.output_proj.weight'].T
+        # Feed-forward block weights
+        state_dict[f'blocks.{i}.ffn_layer.W_1.W'] = weights[f'layers.{i}.ffn.w1.weight'].T
+        state_dict[f'blocks.{i}.ffn_layer.W_2.W'] = weights[f'layers.{i}.ffn.w2.weight'].T
+        state_dict[f'blocks.{i}.ffn_layer.W_3.W'] = weights[f'layers.{i}.ffn.w3.weight'].T
+        # RMSNorm weights for the block
+        state_dict[f'blocks.{i}.rmsnorm_mha.g'] = weights[f'layers.{i}.ln1.weight']
+        state_dict[f'blocks.{i}.rmsnorm_ffn.g'] = weights[f'layers.{i}.ln2.weight']
+
+    # Now your state_dict is complete and you can load it
+    transformerLM.load_state_dict(state_dict=state_dict, strict= False)
+
+    return transformerLM(in_indices)
 
 
 def run_rmsnorm(

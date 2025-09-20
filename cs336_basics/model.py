@@ -3,6 +3,7 @@ import math
 from torch import nn
 import torch.nn.functional as F
 from einops import einsum
+from einops import rearrange
 
 class Linear(nn.Module):
     def __init__(self, in_features: int, out_features: int, device =None, dtype = None):
@@ -73,6 +74,7 @@ class RMSNorm(nn.Module):
         return output.to(in_dtype)
     
 # Position-Wise FFN, used to add computational depth to the model
+# A small neural network that is applied to each token's vector representation individually
 class PositionWiseFeedForward(nn.Module):
     def __init__(self, d_model: int, d_ff: int, device= None, dtype = None):
         super().__init__()
@@ -209,4 +211,155 @@ def scaled_dot_product_attention(
     
     return output
         
+class MultiHeadSelfAttention(nn.Module):
+    def __init__(self, d_model: int, num_heads: int, rope: nn.Module | None = None, device= None, dtype= None):
+        super().__init__()
+        
+        assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
+        
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_k = d_model // num_heads  # Dimension of each head
+        
+        # Create one large projection layer for each of Q, K, and V
+        self.q_proj = Linear(d_model, d_model, device=device, dtype=dtype)
+        self.k_proj = Linear(d_model, d_model, device=device, dtype=dtype)
+        self.v_proj = Linear(d_model, d_model, device=device, dtype=dtype)
+        
+        # The final output projection layer
+        self.out_proj = Linear(d_model, d_model, device=device, dtype=dtype)
+        self.rope = rope
+             
+    def forward(self, x: torch.Tensor, token_positions: torch.Tensor = None, mask: torch.Tensor = None) -> torch.Tensor:
+        # Project input to get Q, K and V for all heads
+        query = self.q_proj(x)
+        key = self.k_proj(x)
+        value = self.v_proj(x)
+        
+        _ , seq_len, _ = x.shape
+        device = x.device
+        
+        # Reshape the Q, K, V to split into nultiple heads
+        query = rearrange(query, "b s (h d_k) -> b h s d_k", h= self.num_heads)
+        key = rearrange(key, "b s (h d_k) -> b h s d_k", h= self.num_heads)
+        value = rearrange(value, "b s (h d_k) -> b h s d_k", h= self.num_heads)
+        # Now query has shape: (batch, num_heads, seq_len, d_k)
+        
+        if self.rope is not None:
+            if token_positions is None:
+                raise ValueError("token_positions must be provided when RoPE is enabled.")
+            query = self.rope(query, token_positions)
+            key = self.rope(key, token_positions)
+            
+        # --- Create a Causal Mask if one isn't provided --- 
+        if mask is None:
+            # This creates a square matrix with True on the lower triangle and False on the upper
+            # It ensures a token can only attend to itself and previous tokens
+            # Use a triangular mask to prevent the front query seeing the latter key
+            # That is why the upper part of the tensor is all zeros (we use the row-vector in coding) 
+            mask = torch.tril(torch.ones(seq_len, seq_len,device = device, dtype = torch.bool))
+        
+        # Apply scaled-dot product 
+        attention_output  = scaled_dot_product_attention(
+            query=query, key=key, value=value, mask=mask)
+        
+        concatenated_output  = rearrange(attention_output , "b h s d -> b s (h d) ")
+        
+        final_output = self.out_proj(concatenated_output)
+        
+        return final_output   
+        
+class TransformerBlock(nn.Module):
+    def __init__(self, d_model: int, num_heads: int, d_ff: int, rope: nn.Module, device = None, dtype = None):
+        super().__init__()
+        
+        self.rmsnorm_mha = RMSNorm(d_model=d_model, device=device, dtype=dtype)
+        self.rmsnorm_ffn = RMSNorm(d_model=d_model, device=device, dtype=dtype)
+        self.mha_layer = MultiHeadSelfAttention(
+            d_model=d_model, num_heads=num_heads , rope=rope, device=device, dtype=dtype)
+        self.ffn_layer = PositionWiseFeedForward(
+            d_model=d_model, d_ff=d_ff, device=device, dtype= dtype
+        )
+        
     
+    def forward(self, x: torch.Tensor, token_positions: torch.Tensor) -> torch.Tensor:
+        # --- Attention Sub-layer (Norm -> MHA -> Add) ---
+        
+        # The first residual connection starts from the original input `x`
+        residual = x
+        # Apply RMSNorm 
+        norm_x = self.rmsnorm_mha(x)
+        # Apply Multi-Head Attention 
+        attn_output = self.mha_layer(norm_x, token_positions = token_positions)
+        # Add the residual connection 
+        h = residual + attn_output
+        
+        # --- FFN Sub-layer  (Norm -> FFN -> Add) ---
+        
+        # The second residual connection starts from the output of the first sub-layer, `h`
+        residual = h
+        # Apply RMSNorm
+        norm_h = self.rmsnorm_ffn(h)
+        # Apply the Feed-Forward Network
+        ffn_output = self.ffn_layer(norm_h)
+        # Add the residual connection
+        output = residual + ffn_output
+        
+        return output
+    
+class TransformerLM(nn.Module):
+    def __init__(
+            self,
+            vocab_size: int,
+            context_length: int,
+            d_model: int,
+            num_layer: int,
+            num_heads: int,
+            d_ff: int,
+            theta: float,
+            device= None,
+            dtype= None
+    ):
+        super().__init__()
+        # Create the token embedding layer
+        self.embedding = Embedding(
+            num_embeddings=vocab_size, embedding_dim=d_model, device= device, dtype= dtype)
+        
+        d_k = d_model // num_heads
+        rope = RoPE(theta= theta, d_k= d_k, max_seq_len= context_length, device= device, dtype = dtype)
+        # Create the stack of transformer blocks using nn.ModuleList
+        # This creates `num_layers` identical blocks and stores them in a list
+
+        self.blocks = nn.ModuleList(
+            [
+                TransformerBlock(d_model= d_model, num_heads= num_heads, d_ff= d_ff, 
+                                 rope= rope, device= device, dtype= dtype)
+                                 for _ in range(num_layer)
+            ]
+        )
+
+        self.norm = RMSNorm(d_model=d_model, device= device, dtype= dtype)
+        # The size of final layer will transform the `d_model` -> `vocab_size`
+        self.linear = Linear(d_model, vocab_size, device= device, dtype= dtype)
+
+    def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
+        # Get the sequence length from the input shape
+        seq_len = token_ids.shape[1]
+
+        # Create the token positions tensor [[0,1,2,...]]
+        token_positions = torch.arange(seq_len, device=token_ids.device)
+
+        # Get token embeddings 
+        x = self.embedding(token_ids)
+        
+        # Pass through the stack of Transformer Blocks
+        for block in self.blocks:
+            # Pass both x and token_positions to each block
+            x = block(x, token_positions = token_positions)
+        
+        # Apply final normalization
+        x = self.norm(x)
+
+        logits = self.linear(x)
+
+        return logits
