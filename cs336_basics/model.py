@@ -5,6 +5,86 @@ import torch.nn.functional as F
 from einops import einsum
 from einops import rearrange
 
+# --- Standalone Functions ---
+
+# softmax
+def softmax(x: torch.Tensor, dim: int) -> torch.Tensor:
+    # Subtract the maximum value from all the elements in the tensor to maintains tability
+    #   `keepdim = True` is crucial for broadcasting to work correctly later.
+    #   `torch.max` returns (values, indices), so we take the .values.
+    max_val = torch.max(x, dim=dim, keepdim = True).values
+    
+    # Subtract the max value. Broadcasting handles the shape automatically.
+    x_subtracted = x - max_val
+    
+    # Exponentiate.
+    x_exp = torch.exp(x_subtracted)
+    
+    # Sum along the specified dimension to get the denominator.
+    denominator = x_exp.sum(dim = dim, keepdim = True)
+    
+    # Normalize and return the result. 
+    return x_exp/ denominator
+    
+def scaled_dot_product_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    mask: torch.Tensor = None
+) -> torch.Tensor:
+    # In the code we use the Q@K^T as the torch uses the row-vector
+    # get d_k from the key tensor's shape
+    d_k = query.size(-1)
+    
+    # Calculate scores using sinsum for clarity
+    # This multiplies the query ('... q d') and the key ('... k d') along the 'd' dimension
+    scores = einsum(query, key, "... q d, ... k d -> ... q k")
+    
+    # Scale the scores
+    scaled_scores = scores / math.sqrt(d_k)
+    
+    # Step 3: Apply the mask (if exists)
+    if mask is not None:
+        # Where the mark is False, we replace the score with negative infinity
+        # This will make the softmax output for that position zero.
+        scaled_scores = scaled_scores.masked_fill(mask == False, -torch.inf)
+        
+    # Apply the softmax to get probabilities
+    attention_probs = softmax(scaled_scores, dim = -1)
+    
+    # Apply probabilities to the value vectors using einsum
+    output = einsum(attention_probs, value, "... q k, ... k v -> ... q v")
+    
+    return output
+
+def cross_entropy(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    """
+    Computes the cross-entropy loss using the log-sum-exp trick for stability.
+    """
+    # Step 1: Stabilize the logits by subtracting maximum logit value
+    # from each row (each last dim finds one). This prevents overflow when we expoentiate.
+    max_logits = torch.max(logits, dim=-1, keepdim=True).values
+    stable_logits = logits - max_logits
+
+    # Step 2: Calculate the log-sum-exp term of the formula.
+    # This is the logarithm of the denominatoe of the softmax function.
+    log_sum_exp = max_logits.squeeze(-1) + torch.log(torch.exp(stable_logits).sum(dim=-1))
+    # log_sum_exp = torch.log(torch.exp(stable_logits).sum(dim=-1, keepdim=True))
+
+    # Step 3：Select the logit scores corresponding to the target tokens.
+    # We need to add a dimension to `targets` to use it with `gather`.
+
+    target_logits = torch.gather(logits, -1, targets.unsqueeze(-1)).squeeze(-1)
+
+    # Step 4: Calculate the loss for each token using the stable formula
+    loss_per_token = log_sum_exp - target_logits
+
+    # return the average loss across all tokens
+    return loss_per_token.mean()
+
+
+# --- nn.Module Classes ---
+
 class Linear(nn.Module):
     def __init__(self, in_features: int, out_features: int, device =None, dtype = None):
         super().__init__()
@@ -161,56 +241,7 @@ class RoPE(nn.Module):
         
         return x_rotated
 
-# softmax
-def softmax(x: torch.Tensor, dim: int) -> torch.Tensor:
-    # Subtract the maximum value from all the elements in the tensor to maintains tability
-    #   `keepdim = True` is crucial for broadcasting to work correctly later.
-    #   `torch.max` returns (values, indices), so we take the .values.
-    max_val = torch.max(x, dim=dim, keepdim = True).values
-    
-    # Subtract the max value. Broadcasting handles the shape automatically.
-    x_subtracted = x - max_val
-    
-    # Exponentiate.
-    x_exp = torch.exp(x_subtracted)
-    
-    # Sum along the specified dimension to get the denominator.
-    denominator = x_exp.sum(dim = dim, keepdim = True)
-    
-    # Normalize and return the result. 
-    return x_exp/ denominator
-    
-def scaled_dot_product_attention(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    mask: torch.Tensor = None
-) -> torch.Tensor:
-    # In the code we use the Q@K^T as the torch uses the row-vector
-    # get d_k from the key tensor's shape
-    d_k = query.size(-1)
-    
-    # Calculate scores using sinsum for clarity
-    # This multiplies the query ('... q d') and the key ('... k d') along the 'd' dimension
-    scores = einsum(query, key, "... q d, ... k d -> ... q k")
-    
-    # Scale the scores
-    scaled_scores = scores / math.sqrt(d_k)
-    
-    # Step 3: Apply the mask (if exists)
-    if mask is not None:
-        # Where the mark is False, we replace the score with negative infinity
-        # This will make the softmax output for that position zero.
-        scaled_scores = scaled_scores.masked_fill(mask == False, -torch.inf)
-        
-    # Apply the softmax to get probabilities
-    attention_probs = softmax(scaled_scores, dim = -1)
-    
-    # Apply probabilities to the value vectors using einsum
-    output = einsum(attention_probs, value, "... q k, ... k v -> ... q v")
-    
-    return output
-        
+ 
 class MultiHeadSelfAttention(nn.Module):
     def __init__(self, d_model: int, num_heads: int, rope: nn.Module | None = None, device= None, dtype= None):
         super().__init__()
@@ -363,3 +394,4 @@ class TransformerLM(nn.Module):
         logits = self.linear(x)
 
         return logits
+    
