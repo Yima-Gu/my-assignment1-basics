@@ -1,5 +1,65 @@
 import torch
+from torch import nn
 import math
+
+
+# --- Standard Functions ---
+
+def get_lr_cosine_schedule(t: int, alpha_max: float, alpha_min: float, T_w: int, T_c: int) -> float:
+    """
+    Calculates the learning rate for a given step `t` using a cosine schedule with warmup.
+    
+    Args:
+        t: The current training step.
+        alpha_max: The maximum learning rate after warmup.
+        alpha_min: The minimum learning rate after annealing.
+        T_w: The number of warmup steps.
+        T_c: The step at which annealing finishes.
+    """
+    # Warm-up phase: Linear increase from 0 to alpha_max
+    if t< T_w:
+        return (t * alpha_max) / T_w
+    
+    # Cosine annealing phase: Smooth decay from alpha_max to alpha_min
+    elif t <= T_c:
+        # Calculate how far along we are in the annealing phase (from 1 to 0)
+        progress = (t - T_w) / (T_c - T_w)
+        # Calculate the cosine component, which goes from 1 to 0
+        cosine_component = 0.5 *(1+math.cos(math.pi * progress))
+        
+        return alpha_min + cosine_component*(alpha_max - alpha_min)
+    
+    # Post-annealing phase: Constant minimum learning rate 
+    else:
+        return alpha_min
+
+def gradient_clipping(parameters: list[nn.Parameter], max_norm: float, eps = 1e-6):
+    """
+    Clips the gradients of a list of parameters in-place.
+    """
+    # Calculate the total L2 norm of all gradients combioned
+    total_norm = 0.0
+    for p in parameters:
+        if p.grad is not None:
+            # Calculate the L2 Norm (Eulidean norm) of this parameter's gradient
+            param_norm = p.grad.data.norm(2)
+            total_norm += param_norm ** 2
+            
+    # Take the square root to get the final total L2 norm.
+    total_norm = total_norm**0.5
+    
+    # Check if the total norm exceeds the threshold
+    if total_norm > max_norm:
+        # Calculate the clipping ratio and scale all gradients
+        clip_coef = max_norm / (total_norm + 1e-6)
+        for p in parameters:
+            if p.grad is not None:
+                # Multiply each gradient by the scaling factor in-place.
+                # The `_` at the end of `mul_` signifies an in-place operation.
+                p.grad.data.mul_(clip_coef)
+            
+
+# --- Classes ---
 
 class AdamW(torch.optim.Optimizer):
     def __init__(self, params, lr = 1e-3, betas = (0.9, 0.999), eps = 1e-8, weight_decay = 1e-2):
@@ -69,5 +129,4 @@ class AdamW(torch.optim.Optimizer):
         #     self.state[p].v = v
         #     p = p - alpha_t *m / (torch.sqrt(v) + self.defaluts['eps'])
         #     p = p - alpha* self.defaults['weight_decay']* p
-            
             
